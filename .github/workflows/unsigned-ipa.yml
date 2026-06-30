@@ -66,7 +66,13 @@ jobs:
 
       - name: Package unsigned IPA
         run: |
-          APP_PATH=$(find ios/build/Build/Products -maxdepth 2 -iname "*.app" | head -1)
+          APP_PATH=$(find ios/build -iname "*.app" -type d | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app bundle found. Directory tree under ios/build/Build/Products:"
+            find ios/build/Build/Products
+            exit 1
+          fi
+          echo "Found app at: $APP_PATH"
           mkdir -p Payload
           cp -r "$APP_PATH" Payload/
           zip -r TruggTutor-unsigned.ipa Payload
