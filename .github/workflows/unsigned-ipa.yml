@@ -50,7 +50,7 @@ jobs:
         working-directory: ios
         run: |
           WORKSPACE=$(ls -d *.xcworkspace | head -1)
-          SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list -json | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>console.log(JSON.parse(d).workspace.schemes[0]))")
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
           echo "Building $SCHEME from $WORKSPACE"
           xcodebuild \
             -workspace "$WORKSPACE" \
