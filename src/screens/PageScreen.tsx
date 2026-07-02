@@ -1,7 +1,7 @@
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useFocusEffect } from '@react-navigation/native';
 import * as DocumentPicker from 'expo-document-picker';
-import PdfPageImage from 'react-native-pdf-page-image';
+import PdfPageImage from 'expo-pdf-page-image';
 import type { PencilKitRef } from 'react-native-pencil-kit';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -143,9 +143,15 @@ export default function PageScreen({ route, navigation }: Props) {
 
       let imageUri = asset.uri;
       let dimensions: { width: number; height: number };
+      let renderedPageUris: string[] = [];
 
       if (isPdf) {
-        const firstPage = await PdfPageImage.generate(asset.uri, 1, 2);
+        const pages = await PdfPageImage.generateAllPages(asset.uri, 2);
+        renderedPageUris = pages.map((p) => p.uri);
+        const firstPage = pages[0];
+        if (!firstPage) {
+          throw new Error('The PDF has no pages to import.');
+        }
         imageUri = firstPage.uri;
         dimensions = { width: firstPage.width, height: firstPage.height };
       } else {
@@ -153,6 +159,9 @@ export default function PageScreen({ route, navigation }: Props) {
       }
 
       const persistedUri = await persistImageFromUri(imageUri, page.id);
+      if (renderedPageUris.length > 0) {
+        await PdfPageImage.cleanupPages(renderedPageUris);
+      }
       const updated: Page = {
         ...page,
         backgroundImageUri: persistedUri,
