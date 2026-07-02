@@ -12,7 +12,7 @@ const InkCanvas = forwardRef<PencilKitRef, InkCanvasProps>(({ width, height }, r
     <PencilKitView
       ref={ref}
       style={[styles.canvas, { width, height }]}
-      drawingPolicy="anyinput"
+      drawingPolicy="pencilonly"
       isOpaque={false}
       alwaysBounceVertical={false}
       alwaysBounceHorizontal={false}

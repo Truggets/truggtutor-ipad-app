@@ -1,4 +1,5 @@
 import { getApiKey } from '../storage/secureConfig';
+import type { ChecklistStep, ChecklistStepStatus } from '../../types/page';
 import { CHECKLIST_MODE_SYSTEM_PROMPT, CHECKLIST_MODE_USER_PROMPT } from './promptTemplates';
 import {
   AnthropicErrorResponse,
@@ -53,9 +54,14 @@ async function callMessagesApi(request: Omit<AnthropicMessagesRequest, 'model'>)
 export async function getChecklistForRegion(
   backgroundBase64Png: string,
   inkBase64Png: string,
-): Promise<string[]> {
+  existingSteps?: ChecklistStep[],
+): Promise<{ steps: ChecklistStep[]; answer: string }> {
+  const userPrompt = existingSteps
+    ? `${CHECKLIST_MODE_USER_PROMPT}\nRe-check this existing checklist. Preserve its step count, order, and text exactly; update only status and hint:\n${JSON.stringify(existingSteps.map(({ text }) => ({ text })))}`
+    : CHECKLIST_MODE_USER_PROMPT;
+
   const text = await callMessagesApi({
-    max_tokens: 512,
+    max_tokens: 1024,
     system: CHECKLIST_MODE_SYSTEM_PROMPT,
     messages: [
       {
@@ -63,14 +69,54 @@ export async function getChecklistForRegion(
         content: [
           { type: 'image', source: { type: 'base64', media_type: 'image/png', data: backgroundBase64Png } },
           { type: 'image', source: { type: 'base64', media_type: 'image/png', data: inkBase64Png } },
-          { type: 'text', text: CHECKLIST_MODE_USER_PROMPT },
+          { type: 'text', text: userPrompt },
         ],
       },
     ],
   });
 
-  return text
-    .split('\n')
-    .map((line) => line.replace(/^\s*\d+[.)]\s*/, '').trim())
-    .filter((line) => line.length > 0);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, ''));
+  } catch {
+    throw new ClaudeApiError('invalid_response', 'Claude returned checklist data in an invalid format.');
+  }
+
+  if (!parsed || typeof parsed !== 'object') {
+    throw new ClaudeApiError('invalid_response', 'Claude returned checklist data in an invalid format.');
+  }
+
+  const candidate = parsed as { steps?: unknown; answer?: unknown };
+  if (!Array.isArray(candidate.steps) || candidate.steps.length === 0 || typeof candidate.answer !== 'string') {
+    throw new ClaudeApiError('invalid_response', 'Claude returned incomplete checklist data.');
+  }
+  if (existingSteps && candidate.steps.length !== existingSteps.length) {
+    throw new ClaudeApiError('invalid_response', 'Claude changed the checklist structure during re-check.');
+  }
+
+  const validStatuses: ChecklistStepStatus[] = ['unchecked', 'correct', 'incorrect'];
+  const steps = candidate.steps.map((value, index): ChecklistStep => {
+    if (!value || typeof value !== 'object') {
+      throw new ClaudeApiError('invalid_response', 'Claude returned an invalid checklist step.');
+    }
+    const step = value as { text?: unknown; status?: unknown; hint?: unknown };
+    if (
+      typeof step.text !== 'string' ||
+      typeof step.status !== 'string' ||
+      !validStatuses.includes(step.status as ChecklistStepStatus)
+    ) {
+      throw new ClaudeApiError('invalid_response', 'Claude returned an invalid checklist step.');
+    }
+
+    const status = step.status as ChecklistStepStatus;
+    return {
+      text: existingSteps?.[index].text ?? step.text.trim(),
+      status,
+      ...(status === 'incorrect' && typeof step.hint === 'string' && step.hint.trim()
+        ? { hint: step.hint.trim() }
+        : {}),
+    };
+  });
+
+  return { steps, answer: candidate.answer.trim() };
 }

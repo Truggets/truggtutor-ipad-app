@@ -1,6 +1,6 @@
 import { Directory, File, Paths } from 'expo-file-system';
 
-import type { Page } from '../../types/page';
+import type { ChecklistStep, ChecklistStepStatus, Page } from '../../types/page';
 
 const MANIFEST_FILE_NAME = 'pages.json';
 const IMAGES_DIR_NAME = 'page-images';
@@ -17,6 +17,36 @@ function imagesDirectory(): Directory {
   return dir;
 }
 
+function normalizeChecklistStep(step: unknown): ChecklistStep | null {
+  if (typeof step === 'string') {
+    return { text: step, status: 'unchecked' };
+  }
+  if (!step || typeof step !== 'object') return null;
+
+  const candidate = step as Partial<ChecklistStep>;
+  if (typeof candidate.text !== 'string') return null;
+  const validStatuses: ChecklistStepStatus[] = ['unchecked', 'correct', 'incorrect'];
+  const status = validStatuses.includes(candidate.status as ChecklistStepStatus)
+    ? (candidate.status as ChecklistStepStatus)
+    : 'unchecked';
+
+  return {
+    text: candidate.text,
+    status,
+    ...(status === 'incorrect' && typeof candidate.hint === 'string' ? { hint: candidate.hint } : {}),
+  };
+}
+
+function normalizePage(page: Page): Page {
+  return {
+    ...page,
+    annotations: (page.annotations ?? []).map((annotation) => ({
+      ...annotation,
+      steps: (annotation.steps as unknown[]).map(normalizeChecklistStep).filter((step) => step !== null),
+    })),
+  };
+}
+
 export async function loadAllPages(): Promise<Page[]> {
   const file = manifestFile();
   if (!file.exists) {
@@ -27,7 +57,7 @@ export async function loadAllPages(): Promise<Page[]> {
     return [];
   }
   try {
-    return JSON.parse(contents) as Page[];
+    return (JSON.parse(contents) as Page[]).map(normalizePage);
   } catch {
     return [];
   }

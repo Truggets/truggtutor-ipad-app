@@ -1,6 +1,7 @@
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useFocusEffect } from '@react-navigation/native';
-import * as ImagePicker from 'expo-image-picker';
+import * as DocumentPicker from 'expo-document-picker';
+import PdfPageImage from 'react-native-pdf-page-image';
 import type { PencilKitRef } from 'react-native-pencil-kit';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -32,15 +33,26 @@ type Props = NativeStackScreenProps<RootStackParamList, 'Page'>;
 
 const DEFAULT_ASPECT_RATIO = 1.29; // ~US Letter portrait, height / width
 
+function getImageDimensions(uri: string): Promise<{ width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    Image.getSize(uri, (width, height) => resolve({ width, height }), reject);
+  });
+}
+
 export default function PageScreen({ route, navigation }: Props) {
   const { pageId } = route.params;
   const { pages, loaded, loadPages, updatePage } = usePageStore();
   const [page, setPage] = useState<Page | null>(null);
   const [selectionActive, setSelectionActive] = useState(false);
+  const [drawingTool, setDrawingTool] = useState<'pen' | 'eraserVector'>('pen');
   const [requestingChecklist, setRequestingChecklist] = useState(false);
+  const [checkingAnnotationId, setCheckingAnnotationId] = useState<string | null>(null);
+  const [importingFile, setImportingFile] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
 
   const inkRef = useRef<PencilKitRef>(null);
   const inkLoadedForPageId = useRef<string | null>(null);
+  const saveConfirmationTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const { width: windowWidth } = useWindowDimensions();
   const displayWidth = windowWidth - 32;
@@ -65,6 +77,14 @@ export default function PageScreen({ route, navigation }: Props) {
     }
   }, [page]);
 
+  useEffect(() => {
+    return () => {
+      if (saveConfirmationTimer.current) {
+        clearTimeout(saveConfirmationTimer.current);
+      }
+    };
+  }, []);
+
   const displayHeight = page?.backgroundImageWidth
     ? (displayWidth * page.backgroundImageHeight) / page.backgroundImageWidth
     : displayWidth * DEFAULT_ASPECT_RATIO;
@@ -75,6 +95,29 @@ export default function PageScreen({ route, navigation }: Props) {
     await updatePage({ ...page, inkBase64 });
   }, [page, updatePage]);
 
+  const handleSave = async () => {
+    if (saveStatus === 'saving') return;
+
+    if (saveConfirmationTimer.current) {
+      clearTimeout(saveConfirmationTimer.current);
+      saveConfirmationTimer.current = null;
+    }
+
+    setSaveStatus('saving');
+    try {
+      await saveInk();
+      setSaveStatus('saved');
+      saveConfirmationTimer.current = setTimeout(() => {
+        setSaveStatus('idle');
+        saveConfirmationTimer.current = null;
+      }, 1600);
+    } catch (err) {
+      setSaveStatus('idle');
+      const message = err instanceof Error ? err.message : 'Something went wrong.';
+      Alert.alert('Save failed', message);
+    }
+  };
+
   useFocusEffect(
     useCallback(() => {
       return () => {
@@ -83,28 +126,53 @@ export default function PageScreen({ route, navigation }: Props) {
     }, [saveInk]),
   );
 
-  const handleImportPhoto = async () => {
-    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (!permission.granted) {
-      Alert.alert('Permission needed', 'Photo library access is required to import a worksheet.');
-      return;
-    }
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images'],
-      quality: 1,
-    });
-    if (result.canceled || !page) return;
+  const handleImportFile = async () => {
+    if (!page || importingFile) return;
 
-    const asset = result.assets[0];
-    const persistedUri = await persistImageFromUri(asset.uri, page.id);
-    const updated: Page = {
-      ...page,
-      backgroundImageUri: persistedUri,
-      backgroundImageWidth: asset.width,
-      backgroundImageHeight: asset.height,
-    };
-    setPage(updated);
-    await updatePage(updated);
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: ['image/*', 'application/pdf'],
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
+      if (result.canceled) return;
+
+      setImportingFile(true);
+      const asset = result.assets[0];
+      const isPdf = asset.mimeType === 'application/pdf' || asset.name.toLowerCase().endsWith('.pdf');
+
+      let imageUri = asset.uri;
+      let dimensions: { width: number; height: number };
+
+      if (isPdf) {
+        const firstPage = await PdfPageImage.generate(asset.uri, 1, 2);
+        imageUri = firstPage.uri;
+        dimensions = { width: firstPage.width, height: firstPage.height };
+      } else {
+        dimensions = await getImageDimensions(asset.uri);
+      }
+
+      const persistedUri = await persistImageFromUri(imageUri, page.id);
+      const updated: Page = {
+        ...page,
+        backgroundImageUri: persistedUri,
+        backgroundImageWidth: dimensions.width,
+        backgroundImageHeight: dimensions.height,
+      };
+      setPage(updated);
+      await updatePage(updated);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Something went wrong.';
+      Alert.alert('Import failed', message);
+    } finally {
+      setImportingFile(false);
+    }
+  };
+
+  const handleDrawingToolSelected = (tool: 'pen' | 'eraserVector') => {
+    setSelectionActive(false);
+    setDrawingTool(tool);
+    inkRef.current?.setTool({ toolType: tool });
   };
 
   const handleRegionSelected = async (region: Region) => {
@@ -112,7 +180,7 @@ export default function PageScreen({ route, navigation }: Props) {
     setSelectionActive(false);
 
     if (!page.backgroundImageUri) {
-      Alert.alert('Import a photo first', 'Checklist mode needs a worksheet photo to read the question from.');
+      Alert.alert('Import a file first', 'Checklist mode needs a worksheet image or PDF.');
       return;
     }
 
@@ -128,13 +196,14 @@ export default function PageScreen({ route, navigation }: Props) {
         region,
       });
 
-      const steps = await getChecklistForRegion(backgroundBase64Png, inkBase64Png);
+      const evaluation = await getChecklistForRegion(backgroundBase64Png, inkBase64Png);
 
       const annotation: ChecklistAnnotation = {
         id: generateId(),
         kind: 'checklist',
         region,
-        steps,
+        steps: evaluation.steps,
+        answer: evaluation.answer,
         createdAt: Date.now(),
       };
       const updated: Page = { ...page, annotations: [...page.annotations, annotation] };
@@ -162,6 +231,64 @@ export default function PageScreen({ route, navigation }: Props) {
     await updatePage(updated);
   };
 
+  const handleRecheckAnnotation = async (id: string) => {
+    if (!page || !inkRef.current || requestingChecklist) return;
+    const annotation = page.annotations.find((item) => item.id === id);
+    if (!annotation || !page.backgroundImageUri) return;
+
+    setRequestingChecklist(true);
+    setCheckingAnnotationId(id);
+    try {
+      const { backgroundBase64Png, inkBase64Png } = await captureRegion({
+        backgroundImageUri: page.backgroundImageUri,
+        backgroundImageWidth: page.backgroundImageWidth,
+        backgroundImageHeight: page.backgroundImageHeight,
+        displayWidth,
+        displayHeight,
+        inkRef: inkRef.current,
+        region: annotation.region,
+      });
+      const evaluation = await getChecklistForRegion(
+        backgroundBase64Png,
+        inkBase64Png,
+        annotation.steps,
+      );
+      const updated: Page = {
+        ...page,
+        annotations: page.annotations.map((item) =>
+          item.id === id
+            ? { ...item, steps: evaluation.steps, answer: evaluation.answer }
+            : item,
+        ),
+      };
+      setPage(updated);
+      await updatePage(updated);
+    } catch (err) {
+      if (err instanceof ClaudeApiError && err.kind === 'no_api_key') {
+        Alert.alert('No API key', 'Add your Anthropic API key in Settings first.');
+      } else {
+        const message = err instanceof Error ? err.message : 'Something went wrong.';
+        Alert.alert('Check failed', message);
+      }
+    } finally {
+      setRequestingChecklist(false);
+      setCheckingAnnotationId(null);
+    }
+  };
+
+  const handleReorderAnnotation = async (id: string, direction: -1 | 1) => {
+    if (!page) return;
+    const index = page.annotations.findIndex((annotation) => annotation.id === id);
+    const targetIndex = index + direction;
+    if (index < 0 || targetIndex < 0 || targetIndex >= page.annotations.length) return;
+
+    const annotations = [...page.annotations];
+    [annotations[index], annotations[targetIndex]] = [annotations[targetIndex], annotations[index]];
+    const updated: Page = { ...page, annotations };
+    setPage(updated);
+    await updatePage(updated);
+  };
+
   if (!page) {
     return (
       <SafeAreaView style={styles.loadingContainer}>
@@ -173,17 +300,71 @@ export default function PageScreen({ route, navigation }: Props) {
   return (
     <SafeAreaView style={styles.container} edges={['bottom', 'left', 'right']}>
       <View style={styles.toolbar}>
-        <TouchableOpacity style={styles.toolbarButton} onPress={handleImportPhoto}>
-          <Text style={styles.toolbarButtonText}>Import Photo</Text>
-        </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.toolbarButton, selectionActive && styles.toolbarButtonActive]}
-          onPress={() => setSelectionActive((active) => !active)}
+          style={[styles.toolbarButton, saveStatus === 'saved' && styles.saveButtonSaved]}
+          onPress={handleSave}
+          disabled={saveStatus === 'saving'}
         >
-          <Text style={[styles.toolbarButtonText, selectionActive && styles.toolbarButtonTextActive]}>
-            {selectionActive ? 'Drag to select question…' : 'Checklist'}
+          <Text style={styles.toolbarButtonText}>
+            {saveStatus === 'saving' ? 'Saving…' : saveStatus === 'saved' ? 'Saved' : 'Save'}
           </Text>
         </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.toolbarButton}
+          onPress={handleImportFile}
+          disabled={importingFile}
+        >
+          <Text style={styles.toolbarButtonText}>{importingFile ? 'Importing…' : 'Import File'}</Text>
+        </TouchableOpacity>
+        <View style={styles.toolStrip} accessibilityRole="toolbar">
+          <TouchableOpacity
+            style={[
+              styles.toolButton,
+              !selectionActive && drawingTool === 'pen' && styles.toolButtonActive,
+            ]}
+            onPress={() => handleDrawingToolSelected('pen')}
+            accessibilityLabel="Pen"
+            accessibilityRole="button"
+            accessibilityState={{ selected: !selectionActive && drawingTool === 'pen' }}
+          >
+            <Text
+              style={[
+                styles.toolIcon,
+                !selectionActive && drawingTool === 'pen' && styles.toolIconActive,
+              ]}
+            >
+              ✎
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[
+              styles.toolButton,
+              !selectionActive && drawingTool === 'eraserVector' && styles.toolButtonActive,
+            ]}
+            onPress={() => handleDrawingToolSelected('eraserVector')}
+            accessibilityLabel="Eraser"
+            accessibilityRole="button"
+            accessibilityState={{ selected: !selectionActive && drawingTool === 'eraserVector' }}
+          >
+            <Text
+              style={[
+                styles.toolIcon,
+                !selectionActive && drawingTool === 'eraserVector' && styles.toolIconActive,
+              ]}
+            >
+              ⌫
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.toolButton, selectionActive && styles.toolButtonActive]}
+            onPress={() => setSelectionActive((active) => !active)}
+            accessibilityLabel="Select question region"
+            accessibilityRole="button"
+            accessibilityState={{ selected: selectionActive }}
+          >
+            <Text style={[styles.scannerIcon, selectionActive && styles.toolIconActive]}>▱</Text>
+          </TouchableOpacity>
+        </View>
         {requestingChecklist ? (
           <View style={styles.thinkingRow}>
             <ActivityIndicator style={styles.toolbarSpinner} />
@@ -192,36 +373,54 @@ export default function PageScreen({ route, navigation }: Props) {
         ) : null}
       </View>
 
-      <ScrollView contentContainerStyle={styles.scrollContent}>
-        <View style={[styles.pageSurface, { width: displayWidth, height: displayHeight }]}>
-          {page.backgroundImageUri ? (
-            <Image
-              source={{ uri: page.backgroundImageUri }}
-              style={{ width: displayWidth, height: displayHeight }}
-              resizeMode="contain"
-            />
-          ) : (
-            <View style={[styles.placeholder, { width: displayWidth, height: displayHeight }]}>
-              <Text style={styles.placeholderText}>Import a worksheet photo, or just write freely below.</Text>
+      <View style={styles.workspace}>
+        <ScrollView contentContainerStyle={styles.scrollContent}>
+          <View style={[styles.pageSurface, { width: displayWidth, height: displayHeight }]}>
+            {page.backgroundImageUri ? (
+              <Image
+                source={{ uri: page.backgroundImageUri }}
+                style={{ width: displayWidth, height: displayHeight }}
+                resizeMode="contain"
+              />
+            ) : (
+              <View style={[styles.placeholder, { width: displayWidth, height: displayHeight }]}>
+                <Text style={styles.placeholderText}>Import a worksheet image or PDF, or write freely below.</Text>
+              </View>
+            )}
+
+            <View style={StyleSheet.absoluteFill} pointerEvents={selectionActive ? 'none' : 'auto'}>
+              <InkCanvas ref={inkRef} width={displayWidth} height={displayHeight} />
             </View>
-          )}
 
-          <View style={StyleSheet.absoluteFill} pointerEvents={selectionActive ? 'none' : 'auto'}>
-            <InkCanvas ref={inkRef} width={displayWidth} height={displayHeight} />
+            <RegionSelector
+              active={selectionActive}
+              width={displayWidth}
+              height={displayHeight}
+              onRegionSelected={handleRegionSelected}
+            />
           </View>
+        </ScrollView>
 
-          {page.annotations.map((annotation) => (
-            <ChecklistCard key={annotation.id} annotation={annotation} onDismiss={handleDismissAnnotation} />
-          ))}
-
-          <RegionSelector
-            active={selectionActive}
-            width={displayWidth}
-            height={displayHeight}
-            onRegionSelected={handleRegionSelected}
-          />
-        </View>
-      </ScrollView>
+        {page.annotations.length > 0 ? (
+          <View style={styles.checklistRail}>
+            <ScrollView
+              contentContainerStyle={styles.checklistRailContent}
+              showsVerticalScrollIndicator={false}
+            >
+              {page.annotations.map((annotation) => (
+                <ChecklistCard
+                  key={annotation.id}
+                  annotation={annotation}
+                  checking={checkingAnnotationId === annotation.id}
+                  onDismiss={handleDismissAnnotation}
+                  onRecheck={handleRecheckAnnotation}
+                  onReorder={handleReorderAnnotation}
+                />
+              ))}
+            </ScrollView>
+          </View>
+        ) : null}
+      </View>
     </SafeAreaView>
   );
 }
@@ -244,15 +443,43 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     backgroundColor: '#F0F0F0',
   },
-  toolbarButtonActive: {
+  toolStrip: {
+    flexDirection: 'row',
+    padding: 2,
+    borderRadius: 9,
+    backgroundColor: '#F0F0F0',
+  },
+  toolButton: {
+    width: 36,
+    height: 32,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 7,
+  },
+  toolButtonActive: {
     backgroundColor: '#3478F6',
+  },
+  toolIcon: { fontSize: 20, lineHeight: 22, color: '#333' },
+  toolIconActive: { color: '#fff' },
+  scannerIcon: { fontSize: 22, lineHeight: 23, color: '#333' },
+  saveButtonSaved: {
+    backgroundColor: '#DDF4E4',
   },
   thinkingRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginLeft: 4 },
   thinkingText: { fontSize: 12, color: '#666' },
   toolbarButtonText: { fontSize: 13, fontWeight: '600', color: '#333' },
-  toolbarButtonTextActive: { color: '#fff' },
   toolbarSpinner: { marginLeft: 8 },
+  workspace: { flex: 1 },
   scrollContent: { alignItems: 'center', paddingVertical: 16 },
+  checklistRail: {
+    position: 'absolute',
+    left: 12,
+    top: 12,
+    bottom: 12,
+    width: 280,
+    zIndex: 10,
+  },
+  checklistRailContent: { gap: 12, paddingBottom: 16 },
   pageSurface: {
     backgroundColor: '#fff',
     borderWidth: StyleSheet.hairlineWidth,

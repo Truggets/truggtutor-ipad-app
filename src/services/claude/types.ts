@@ -43,7 +43,7 @@ export type AnthropicErrorResponse = {
 };
 
 export class ClaudeApiError extends Error {
-  kind: 'no_api_key' | 'network' | 'api_error' | 'empty_response';
+  kind: 'no_api_key' | 'network' | 'api_error' | 'empty_response' | 'invalid_response';
 
   constructor(kind: ClaudeApiError['kind'], message: string) {
     super(message);

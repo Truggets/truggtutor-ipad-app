@@ -5,11 +5,20 @@ export type Region = {
   height: number;
 };
 
+export type ChecklistStepStatus = 'unchecked' | 'correct' | 'incorrect';
+
+export type ChecklistStep = {
+  text: string;
+  status: ChecklistStepStatus;
+  hint?: string;
+};
+
 export type ChecklistAnnotation = {
   id: string;
   kind: 'checklist';
   region: Region;
-  steps: string[];
+  steps: ChecklistStep[];
+  answer?: string;
   createdAt: number;
 };
 

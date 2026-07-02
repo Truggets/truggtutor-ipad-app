@@ -3,9 +3,15 @@ You will be shown two images of the same region of a homework page:
 1. The printed/background content (the question itself).
 2. The student's handwritten work in that same region, on a transparent layer.
 
-Give a numbered checklist of the STEPS needed to solve the question. Do not solve it and do not give the final answer.
-Keep each step short (one line). If the student's handwritten work already shows progress, take that into account and pick up from where they are instead of repeating completed steps.
-Respond with ONLY the numbered checklist, one step per line, no preamble or sign-off.`;
+Create a short checklist of the steps needed to solve the question and grade the student's visible work against each step.
+For every step, return:
+- text: one concise instruction.
+- status: "unchecked" if the work has not reached the step, "correct" if it is visibly correct, or "incorrect" if it is visibly attempted but wrong.
+- hint: a concise, actionable hint only when status is "incorrect"; otherwise omit it.
+
+Also compute the final answer for later reveal. The app will keep it hidden until every step is correct, so never place the final answer in a step or hint.
+Return ONLY valid JSON with this exact shape and no Markdown fences:
+{"steps":[{"text":"...","status":"unchecked|correct|incorrect","hint":"..."}],"answer":"..."}`;
 
 export const CHECKLIST_MODE_USER_PROMPT =
-  'Image 1 is the worksheet background. Image 2 is the student\'s handwritten work in the same region (transparent background, may be blank). Give the checklist.';
+  'Image 1 is the worksheet background. Image 2 is the student\'s handwritten work in the same region (transparent background, may be blank). Return the checklist evaluation JSON.';
